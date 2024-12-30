@@ -38,7 +38,7 @@ _APIS_TO_BE_ENABLED = [
     'bigquery.googleapis.com',
     'bigquerydatatransfer.googleapis.com',
 ]
-_DEFAULT_DATASET_ID = 'merchant_intel'
+_DEFAULT_DATASET_ID = 'merch_intel'
 _DEFAULT_DATASET_LOCATION = 'us'
 
 

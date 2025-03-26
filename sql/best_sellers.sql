@@ -12,6 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Creates empty BestSeller tables if not exists yet.
+
+CREATE TABLE IF NOT EXISTS `{project_id}.{dataset}.BestSellersProductClusterWeekly_{merchant_id}` (
+  country_code STRING,
+  report_category_id INT64,
+  entity_id STRING,
+  title STRING,
+  brand STRING,
+  category_l1 STRING,
+  category_l2 STRING,
+  category_l3 STRING,
+  category_l4 STRING,
+  category_l5 STRING,
+  variant_gtins STRING,
+  product_inventory_status STRING,
+  brand_inventory_status STRING,
+  rank INT64,
+  previous_rank INT64,
+  relative_demand STRING,
+  previous_relative_demand STRING,
+  relative_demand_change STRING,
+  price_range STRUCT<
+    min_amount_micros INT64,
+    max_amount_micros INT64,
+    currency_code STRING
+  >
+)
+PARTITION BY
+  TIMESTAMP_TRUNC(_PARTITIONTIME, DAY)
+OPTIONS (
+  description = 'https://cloud.google.com/bigquery/docs/merchant-center-best-sellers-schema'
+);
+
+CREATE TABLE IF NOT EXISTS `{project_id}.{dataset}.BestSellersEntityProductMapping_{merchant_id}` (
+  entity_id STRING,
+  product_id STRING
+)
+PARTITION BY
+  TIMESTAMP_TRUNC(_PARTITIONTIME, DAY)
+OPTIONS (
+  description = 'https://cloud.google.com/bigquery/docs/merchant-center-best-sellers-schema'
+);
+
 # Creates stored procedure for materializing best sellers data.
 
 CREATE OR REPLACE

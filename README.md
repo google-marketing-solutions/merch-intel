@@ -62,6 +62,8 @@ The user running the installation script will need the following permissions:
 
 * [Editor (or owner) role in the Google Cloud project](https://cloud.google.com/iam/docs/understanding-roles)
 
+NOTE: If you're running this using an MCA account as your Merchant Center ID, you won't have access to the Best Seller section in the dashboard (last two tabs) due to a [lack of support](https://cloud.google.com/bigquery/docs/merchant-center-transfer#multi-client_account_mca_support) for Multi-Client Accounts for the BestSeller reports on the Merchant Center exports.
+
 ### 3.2. Setup local environment
 
 ### 3.2.1. Option 1: Cloud Shell

@@ -19,24 +19,29 @@ import copy
 import datetime
 import logging
 import time
-from typing import Any, Dict
+from typing import Dict, Optional
 
-import auth
+import google.auth
+from google.auth import impersonated_credentials
+from google.auth.exceptions import DefaultCredentialsError
 from google.cloud import bigquery_datatransfer
+from google.cloud.bigquery_datatransfer_v1.types import TransferConfig
+from google.cloud.bigquery_datatransfer_v1.types import TransferState
 from google.protobuf import struct_pb2
 from google.protobuf import timestamp_pb2
 import pytz
 
+# The unique identifier for the Merchant Center data source.
+_MERCHANT_CENTER_ID = 'merchant_center'
+# The unique identifier for the Google Ads data source.
+_GOOGLE_ADS_ID = 'google_ads'
+# The unique identifier for the Scheduled Query data source.
+_SCHEDULED_QUERY_ID = 'scheduled_query'
 
-_MERCHANT_CENTER_ID = 'merchant_center'  # Data source id for Merchant Center.
-_GOOGLE_ADS_ID = 'google_ads'  # Data source id for Google Ads.
-_SLEEP_SECONDS = 60  # Seconds to sleep before checking resource status.
+# Polling interval in seconds between transfer status checks.
+_SLEEP_SECONDS = 60
+# Maximum number of polling attempts to prevent infinite loops.
 _MAX_POLL_COUNTER = 100
-_PENDING_STATE = 2
-_RUNNING_STATE = 3
-_SUCCESS_STATE = 4
-_FAILED_STATE = 5
-_CANCELLED_STATE = 6
 
 _ADS_TABLES = [
     'ShoppingProductStats',
@@ -51,25 +56,66 @@ class DataTransferError(Error):
   """An exception to be raised when data transfer was not successful."""
 
 
-class CloudDataTransferUtils(object):
+class CloudDataTransferUtils:
   """This class provides methods to manage BigQuery data transfers.
 
   Typical usage example:
     >>> data_transfer = CloudDataTransferUtils('project_id')
-    >>> data_transfer.create_merchant_center_transfer(12345, 'dataset_id')
+    >>> data_transfer.create_merchant_center_transfer(12345, 'dataset_id', 'US')
   """
 
-  def __init__(self, project_id: str):
-    """Initialise new instance of CloudDataTransferUtils.
+  def __init__(
+      self,
+      project_id: str,
+      impersonated_service_account: Optional[str] = None,
+  ):
+    """Initialises new instance of CloudDataTransferUtils.
 
     Args:
       project_id: GCP project id.
+      impersonated_service_account: Optional. The email of the service account
+        to impersonate. If None, uses Application Default Credentials.
     """
     self.project_id = project_id
-    self.client = bigquery_datatransfer.DataTransferServiceClient()
+
+    try:
+      if impersonated_service_account:
+        logging.info(
+            'Impersonation mode ENABLED. Using service account: %s',
+            impersonated_service_account,
+        )
+
+        source_credentials, _ = google.auth.default(
+            scopes=['https://www.googleapis.com/auth/cloud-platform']
+        )
+
+        target_credentials = impersonated_credentials.Credentials(
+            source_credentials=source_credentials,
+            target_principal=impersonated_service_account,
+            target_scopes=['https://www.googleapis.com/auth/cloud-platform'],
+        )
+
+        self.client = bigquery_datatransfer.DataTransferServiceClient(
+            credentials=target_credentials
+        )
+      else:
+        logging.info(
+            'Impersonation mode DISABLED. Using Application Default '
+            'Credentials.'
+        )
+        self.client = bigquery_datatransfer.DataTransferServiceClient()
+
+    except DefaultCredentialsError as e:
+      logging.error(
+          'Could not determine credentials. Please configure your environment '
+          'with "gcloud auth application-default login" or ensure you are '
+          'running in a configured GCP environment. Error: %s',
+          e,
+      )
+      raise
 
   def wait_for_transfer_completion(
-      self, transfer_config: Dict[str, Any], dataset_location: str
+      self, transfer_config: TransferConfig, dataset_location: str
   ) -> None:
     """Waits for the completion of data transfer operation.
 
@@ -86,43 +132,53 @@ class CloudDataTransferUtils(object):
     """
     transfer_config_name = transfer_config.name
     transfer_config_id = transfer_config_name.split('/')[-1]
-    poll_counter = 0  # Counter to keep polling count.
+    poll_counter = 0
+
     while True:
-      transfer_config_path = f'projects/{self.project_id}/locations/{dataset_location}/transferConfigs/{transfer_config_id}'
-      response = self.client.list_transfer_runs(
-          {'parent': transfer_config_path}
+      transfer_config_path = (
+          f'projects/{self.project_id}/locations/{dataset_location}'
+          f'/transferConfigs/{transfer_config_id}'
       )
-      latest_transfer = None
-      for transfer in response:
-        latest_transfer = transfer
-        break
+      response = self.client.list_transfer_runs(parent=transfer_config_path)
+      latest_transfer = next(iter(response), None)
+
       if not latest_transfer:
+        logging.info(
+            'No transfer runs found for %s. Assuming completion.',
+            transfer_config_name,
+        )
         return
-      if latest_transfer.state == _SUCCESS_STATE:
+
+      if latest_transfer.state == TransferState.SUCCEEDED:
         logging.info('Transfer %s was successful.', transfer_config_name)
         return
-      if (
-          latest_transfer.state == _FAILED_STATE
-          or latest_transfer.state == _CANCELLED_STATE
+
+      if latest_transfer.state in (
+          TransferState.FAILED,
+          TransferState.CANCELLED,
       ):
         error_message = (
             f'Transfer {transfer_config_name} was not successful. '
-            f'Error - {latest_transfer.error_status}'
+            f'Final state: {latest_transfer.state.name}. '
+            f'Error: {latest_transfer.error_status}'
         )
         logging.error(error_message)
         raise DataTransferError(error_message)
+
       logging.info(
-          'Transfer %s still in progress. Sleeping for %s seconds before '
-          'checking again.',
+          'Transfer %s still in progress (State: %s). Sleeping for %s '
+          'seconds before checking again.',
           transfer_config_name,
+          latest_transfer.state.name,
           _SLEEP_SECONDS,
       )
       time.sleep(_SLEEP_SECONDS)
+
       poll_counter += 1
       if poll_counter >= _MAX_POLL_COUNTER:
         error_message = (
-            f'Transfer {transfer_config_name} is taking too long'
-            ' to finish. Hence failing the request.'
+            f'Transfer {transfer_config_name} is taking too long to finish. '
+            'Exiting due to max poll attempts.'
         )
         logging.error(error_message)
         raise DataTransferError(error_message)
@@ -131,27 +187,13 @@ class CloudDataTransferUtils(object):
       self,
       data_source_id: str,
       dataset_location: str,
-      destination_dataset_id: str = None,
-      params: Dict[str, str] = None,
-      name: str = None,
-  ) -> bool:
-    """Gets data transfer if it already exists.
-
-    Args:
-      data_source_id: Data source ID.
-      dataset_location: Location of the BigQuery dataset.
-      destination_dataset_id: BigQuery dataset id.
-      params: Data transfer specific parameters.
-      name: The display name of the transfer.
-
-    Returns:
-      Data Transfer if the transfer already exists.
-      None otherwise.
-    """
+      destination_dataset_id: Optional[str] = None,
+      params: Optional[Dict[str, str]] = None,
+      name: Optional[str] = None,
+  ) -> Optional[TransferConfig]:
+    """Gets data transfer if it already exists."""
     parent = f'projects/{self.project_id}/locations/{dataset_location}'
-    for transfer_config in self.client.list_transfer_configs(
-        {'parent': parent}
-    ):
+    for transfer_config in self.client.list_transfer_configs(parent=parent):
       if transfer_config.data_source_id != data_source_id:
         continue
       if (
@@ -159,32 +201,26 @@ class CloudDataTransferUtils(object):
           and transfer_config.destination_dataset_id != destination_dataset_id
       ):
         continue
-      # If the transfer config is in Failed state, we should ignore.
+
+      # Ignore transfers that are already in a failed or cancelled state.
       is_valid_state = transfer_config.state in (
-          _PENDING_STATE,
-          _RUNNING_STATE,
-          _SUCCESS_STATE,
+          TransferState.PENDING,
+          TransferState.RUNNING,
+          TransferState.SUCCEEDED,
       )
       params_match = self._check_params_match(transfer_config, params)
       name_matches = name is None or name == transfer_config.display_name
+
       if params_match and is_valid_state and name_matches:
         return transfer_config
     return None
 
   def _check_params_match(
       self,
-      transfer_config: bigquery_datatransfer.TransferConfig,
+      transfer_config: TransferConfig,
       params: Dict[str, str],
   ) -> bool:
-    """Checks if given parameters are present in transfer config.
-
-    Args:
-      transfer_config: Data transfer configuration.
-      params: Data transfer specific parameters.
-
-    Returns:
-      True if given parameters are present in transfer config, False otherwise.
-    """
+    """Checks if given parameters are present in transfer config."""
     if not params:
       return True
     for key, value in params.items():
@@ -195,101 +231,85 @@ class CloudDataTransferUtils(object):
 
   def _update_existing_transfer(
       self,
-      transfer_config: bigquery_datatransfer.TransferConfig,
-      params: Dict[str, str],
-  ) -> bigquery_datatransfer.TransferConfig:
-    """Updates existing data transfer.
-
-    If the parameters are already present in the config, then the transfer
-    config update is skipped.
-
-    Args:
-      transfer_config: Data transfer configuration to update.
-      params: Data transfer specific parameters.
-
-    Returns:
-      Updated data transfer config.
-    """
+      transfer_config: TransferConfig,
+      params: struct_pb2.Struct,
+  ) -> TransferConfig:
+    """Updates existing data transfer if parameters have changed."""
     if self._check_params_match(transfer_config, params):
       logging.info(
-          'The data transfer config "%s" parameters match. Hence '
-          'skipping update.',
+          'The data transfer config "%s" parameters already match. '
+          'Skipping update.',
           transfer_config.display_name,
       )
       return transfer_config
+
     new_transfer_config = copy.deepcopy(transfer_config)
-    # Clear existing parameter values.
-    new_transfer_config.params = {}
-    for key, value in params.items():
-      new_transfer_config.params[key] = value
-    # Only params field is updated.
+    new_transfer_config.params.clear()
+    new_transfer_config.params.update(params)
+
+    # The update_mask ensures that only the 'params' field is modified.
     update_mask = {'paths': ['params']}
     request = bigquery_datatransfer.UpdateTransferConfigRequest(
         transfer_config=new_transfer_config, update_mask=update_mask
     )
     new_transfer_config = self.client.update_transfer_config(request)
     logging.info(
-        'The data transfer config "%s" parameters updated.',
+        'The data transfer config "%s" parameters were updated.',
         new_transfer_config.display_name,
     )
     return new_transfer_config
 
   def create_merchant_center_transfer(
       self, merchant_id: str, destination_dataset: str, dataset_location: str
-  ) -> bigquery_datatransfer.TransferConfig:
-    """Creates a new merchant center transfer.
-
-    Merchant center allows retailers to store product info into Google. This
-    method creates a data transfer config to copy the product data to BigQuery.
-
-    Args:
-      merchant_id: Google Merchant Center(GMC) account id.
-      destination_dataset: BigQuery dataset id.
-      dataset_location: Location of the BigQuery dataset.
-
-    Returns:
-      Transfer config.
-    """
+  ) -> TransferConfig:
+    """Creates a new merchant center transfer."""
     logging.info('Creating Merchant Center Transfer.')
     parameters = struct_pb2.Struct()
-    parameters['merchant_id'] = merchant_id
-    parameters['export_products'] = True
-    parameters['export_performance'] = True
-    parameters['export_best_sellers_v2'] = True
-    parameters['export_price_competitiveness'] = True
-    parameters['export_price_insights'] = True
-    parameters['export_offer_targeting'] = True
-    data_transfer_config = self._get_existing_transfer(
-        _MERCHANT_CENTER_ID, dataset_location, destination_dataset, parameters
+    parameters.update({
+        'merchant_id': merchant_id,
+        'export_products': True,
+        'export_performance': True,
+        'export_best_sellers_v2': True,
+        'export_price_competitiveness': True,
+        'export_price_insights': True,
+        'export_offer_targeting': True,
+    })
+
+    existing_transfer = self._get_existing_transfer(
+        _MERCHANT_CENTER_ID,
+        dataset_location,
+        destination_dataset_id=destination_dataset,
+        params=parameters,
     )
-    if data_transfer_config:
+    if existing_transfer:
       logging.info(
           'Data transfer for merchant id %s to destination dataset %s '
           'already exists.',
           merchant_id,
           destination_dataset,
       )
-      return self._update_existing_transfer(data_transfer_config, parameters)
+      return self._update_existing_transfer(existing_transfer, parameters)
+
     logging.info(
         'Creating data transfer for merchant id %s to destination dataset %s',
         merchant_id,
         destination_dataset,
     )
     parent = f'projects/{self.project_id}/locations/{dataset_location}'
-    input_config = {
-        'display_name': f'Merchant Center Transfer - {merchant_id}',
-        'data_source_id': _MERCHANT_CENTER_ID,
-        'destination_dataset_id': destination_dataset,
-        'params': parameters,
-        'data_refresh_window_days': 0,
-    }
+    input_config = TransferConfig(
+        display_name=f'Merchant Center Transfer - {merchant_id}',
+        data_source_id=_MERCHANT_CENTER_ID,
+        destination_dataset_id=destination_dataset,
+        params=parameters,
+        data_refresh_window_days=0,
+    )
     request = bigquery_datatransfer.CreateTransferConfigRequest(
         parent=parent,
         transfer_config=input_config,
     )
     transfer_config = self.client.create_transfer_config(request)
     logging.info(
-        'Data transfer created for merchant id %s to destination dataset %s',
+        'Data transfer created for merchant id %s to destination dataset %s.',
         merchant_id,
         destination_dataset,
     )
@@ -301,79 +321,71 @@ class CloudDataTransferUtils(object):
       destination_dataset: str,
       dataset_location: str,
       backfill_days: int = 30,
-  ) -> bigquery_datatransfer.TransferConfig:
-    """Creates a new Google Ads transfer.
-
-    This method creates a data transfer config to copy Google Ads data to
-    BigQuery dataset.
-
-    Args:
-      customer_id: Google Ads customer id.
-      destination_dataset: BigQuery dataset id.
-      dataset_location: Location of the BigQuery dataset.
-      backfill_days: Number of days to backfill.
-
-    Returns:
-      Transfer config.
-    """
+  ) -> TransferConfig:
+    """Creates a new Google Ads transfer and schedules a backfill."""
     logging.info('Creating Google Ads Transfer.')
 
     parameters = struct_pb2.Struct()
-    parameters['customer_id'] = customer_id
-    parameters['include_pmax'] = True
-    parameters['table_filter'] = ','.join(_ADS_TABLES)
-    data_transfer_config = self._get_existing_transfer(
-        _GOOGLE_ADS_ID, dataset_location, destination_dataset, parameters
+    parameters.update({
+        'customer_id': customer_id,
+        'include_pmax': True,
+        'table_filter': ','.join(_ADS_TABLES),
+    })
+    existing_transfer = self._get_existing_transfer(
+        _GOOGLE_ADS_ID,
+        dataset_location,
+        destination_dataset_id=destination_dataset,
+        params=parameters,
     )
-    if data_transfer_config:
+    if existing_transfer:
       logging.info(
           'Data transfer for Google Ads customer id %s to destination dataset '
           '%s already exists.',
           customer_id,
           destination_dataset,
       )
-      return data_transfer_config
+      return existing_transfer
+
     logging.info(
         'Creating data transfer for Google Ads customer id %s to destination '
-        'dataset %s',
+        'dataset %s.',
         customer_id,
         destination_dataset,
     )
     parent = f'projects/{self.project_id}/locations/{dataset_location}'
-    input_config = {
-        'display_name': f'Google Ads Transfer - {customer_id}',
-        'data_source_id': _GOOGLE_ADS_ID,
-        'destination_dataset_id': destination_dataset,
-        'params': parameters,
-        'data_refresh_window_days': 1,
-    }
+    input_config = TransferConfig(
+        display_name=f'Google Ads Transfer - {customer_id}',
+        data_source_id=_GOOGLE_ADS_ID,
+        destination_dataset_id=destination_dataset,
+        params=parameters,
+        data_refresh_window_days=1,
+    )
     request = bigquery_datatransfer.CreateTransferConfigRequest(
         parent=parent,
         transfer_config=input_config,
     )
     transfer_config = self.client.create_transfer_config(request=request)
     logging.info(
-        'Data transfer created for Google Ads customer id %s to destination '
-        'dataset %s',
+        'Data transfer created for Google Ads customer id %s.',
         customer_id,
-        destination_dataset,
     )
-    if backfill_days:
-      transfer_config_name = transfer_config.name
-      transfer_config_id = transfer_config_name.split('/')[-1]
-      start_time = datetime.datetime.now(tz=pytz.utc) - datetime.timedelta(
-          days=backfill_days
-      )
-      end_time = datetime.datetime.now(tz=pytz.utc)
-      start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
-      end_time = end_time.replace(hour=0, minute=0, second=0, microsecond=0)
-      transfer_config_path = f'{parent}/transferConfigs/{transfer_config_id}'
+
+    if backfill_days > 0:
+      logging.info('Scheduling backfill for the last %d days.', backfill_days)
+      now_utc = datetime.datetime.now(pytz.utc)
+      start_time = now_utc - datetime.timedelta(days=backfill_days)
+      end_time = now_utc
       start_time_pb = timestamp_pb2.Timestamp()
       end_time_pb = timestamp_pb2.Timestamp()
-      start_time_pb.FromDatetime(start_time)
-      end_time_pb.FromDatetime(end_time)
+      start_time_pb.FromDatetime(
+          start_time.replace(hour=0, minute=0, second=0, microsecond=0)
+      )
+      end_time_pb.FromDatetime(
+          end_time.replace(hour=0, minute=0, second=0, microsecond=0)
+      )
+
       self.client.schedule_transfer_runs(
-          parent=transfer_config_path,
+          parent=transfer_config.name,
           start_time=start_time_pb,
           end_time=end_time_pb,
       )
@@ -381,47 +393,35 @@ class CloudDataTransferUtils(object):
 
   def schedule_query(
       self, name: str, dataset_location: str, query_string: str
-  ) -> bigquery_datatransfer.TransferConfig:
-    """Schedules query to run every day.
-
-    Args:
-      name: Name of the scheduled query.
-      dataset_location: Location of the BigQuery dataset.
-      query_string: The query to be run.
-
-    Returns:
-      Transfer config.
-    """
-    data_transfer_config = self._get_existing_transfer(
-        'scheduled_query', dataset_location, name=name
-    )
+  ) -> TransferConfig:
+    """Schedules a query to run daily."""
     parameters = struct_pb2.Struct()
     parameters['query'] = query_string
-    if data_transfer_config:
-      logging.info(
-          'Data transfer for scheduling query "%s" already exists.', name
-      )
+
+    existing_transfer = self._get_existing_transfer(
+        _SCHEDULED_QUERY_ID, dataset_location, name=name
+    )
+
+    if existing_transfer:
+      logging.info('Scheduled query "%s" already exists. Updating...', name)
       updated_transfer_config = self._update_existing_transfer(
-          data_transfer_config, parameters
+          existing_transfer, parameters
       )
-      logging.info('Data transfer for scheduling query "%s" updated.', name)
+      logging.info('Triggering a manual run for the updated query.')
       start_time_pb = timestamp_pb2.Timestamp()
-      start_time = datetime.datetime.now(tz=pytz.utc)
-      start_time_pb.FromDatetime(start_time)
+      start_time_pb.FromDatetime(datetime.datetime.now(pytz.utc))
       request = bigquery_datatransfer.StartManualTransferRunsRequest(
-          parent=updated_transfer_config.name, requested_run_time=start_time_pb
+          parent=updated_transfer_config.name,
+          requested_run_time=start_time_pb,
       )
       self.client.start_manual_transfer_runs(request=request)
-      logging.info(
-          'One time manual run started. It might take up to 1 hour for'
-          ' performance data to reflect on the dash.'
-      )
       return updated_transfer_config
+
     parent = f'projects/{self.project_id}/locations/{dataset_location}'
-    input_config = bigquery_datatransfer.TransferConfig(
+    input_config = TransferConfig(
         display_name=name,
-        data_source_id='scheduled_query',
-        params={'query': query_string},
+        data_source_id=_SCHEDULED_QUERY_ID,
+        params=parameters,
         schedule='every 24 hours',
     )
     request = bigquery_datatransfer.CreateTransferConfigRequest(
@@ -429,16 +429,15 @@ class CloudDataTransferUtils(object):
         transfer_config=input_config,
     )
     transfer_config = self.client.create_transfer_config(request=request)
+    logging.info('Scheduled query "%s" created successfully.', name)
     return transfer_config
 
   def _get_data_source(
       self, data_source_id: str, dataset_location: str
   ) -> bigquery_datatransfer.DataSource:
-    """Returns data source.
-
-    Args:
-      data_source_id: Data source ID.
-      dataset_location: Location of the BigQuery dataset.
-    """
-    name = f'projects/{self.project_id}/locations/{dataset_location}/dataSources/{data_source_id}'
-    return self.client.get_data_source({'name': name})
+    """Returns data source details."""
+    name = (
+        f'projects/{self.project_id}/locations/{dataset_location}/'
+        f'dataSources/{data_source_id}'
+    )
+    return self.client.get_data_source(name=name)

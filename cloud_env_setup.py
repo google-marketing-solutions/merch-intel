@@ -1,7 +1,7 @@
 # Copyright 2024 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
+# You may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -31,6 +31,7 @@ from plugins.cloud_utils import cloud_api
 
 # Set logging level.
 logging.getLogger().setLevel(logging.INFO)
+# Suppress noisy logs from the API client library.
 logging.getLogger('googleapiclient.discovery').setLevel(logging.WARNING)
 
 # Required Cloud APIs to be enabled.
@@ -86,45 +87,69 @@ def parse_arguments() -> argparse.Namespace:
   parser.add_argument(
       '--ads_customer_id', help='Google Ads external customer ID', required=True
   )
+
+  parser.add_argument(
+      '--service_account_email',
+      type=str,
+      default=None,
+      required=False,
+      help=(
+          'Optional. The email of the service account to impersonate for API'
+          ' calls.'
+      ),
+  )
   return parser.parse_args()
 
 
 def main():
+  """Main function to orchestrate the environment setup."""
   args = parse_arguments()
   ads_customer_id = args.ads_customer_id.replace('-', '')
-  data_transfer = cloud_data_transfer.CloudDataTransferUtils(args.project_id)
-  logging.info('Enabling APIs.')
+
+  data_transfer = cloud_data_transfer.CloudDataTransferUtils(
+      args.project_id, args.service_account_email
+  )
+
+  logging.info('Enabling APIs...')
   enable_apis(args.project_id)
-  logging.info('Enabled APIs.')
-  logging.info('Creating %s dataset.', args.dataset_id)
+  logging.info('APIs enabled.')
+
+  logging.info('Creating dataset "%s"...', args.dataset_id)
   cloud_bigquery.create_dataset_if_not_exists(
       args.project_id, args.dataset_id, args.dataset_location
   )
+
   merchant_center_config = data_transfer.create_merchant_center_transfer(
       args.merchant_id, args.dataset_id, args.dataset_location
   )
   ads_config = data_transfer.create_google_ads_transfer(
       ads_customer_id, args.dataset_id, args.dataset_location
   )
+
   try:
-    logging.info('Checking the GMC data transfer status.')
+    logging.info('Waiting for GMC data transfer to complete initial run...')
     data_transfer.wait_for_transfer_completion(
         merchant_center_config, args.dataset_location
     )
-    logging.info('The GMC data have been successfully transferred.')
+    logging.info('GMC data transfer successful.')
   except cloud_data_transfer.DataTransferError:
     logging.error(
-        'If you have just created GMC transfer - you may need to'
-        'wait for up to 90 minutes before the data of your Merchant'
-        'account are prepared and available for the transfer.'
+        'GMC transfer failed. If this is the first run, you may need to wait '
+        'up to 90 minutes for data to be prepared before the transfer can '
+        'succeed.'
     )
     raise
-  logging.info('Checking the Google Ads data transfer status.')
+
+  logging.info(
+      'Waiting for GMC data transfer to complete initial run...'
+  )
   data_transfer.wait_for_transfer_completion(ads_config, args.dataset_location)
-  logging.info('The Google Ads data have been successfully transferred.')
+  logging.info('Google Ads data transfer successful.')
+
   cloud_bigquery.load_language_codes(args.project_id, args.dataset_id)
   cloud_bigquery.load_geo_targets(args.project_id, args.dataset_id)
-  logging.info('Creating Merch Intel tables.')
+
+  logging.info('Creating Merch Intel tables and views...')
   cloud_bigquery.execute_queries(
       args.project_id,
       args.dataset_id,
@@ -132,8 +157,9 @@ def main():
       args.merchant_id,
       ads_customer_id,
   )
-  logging.info('Created Merch Intel tables.')
-  logging.info('Updating targeted products')
+  logging.info('Merch Intel tables and views created.')
+
+  logging.info('Scheduling the main workflow...')
   query = cloud_bigquery.get_main_workflow_sql(
       args.project_id, args.dataset_id, args.merchant_id, ads_customer_id
   )
@@ -142,7 +168,7 @@ def main():
       args.dataset_location,
       query,
   )
-  logging.info('Job created to run Merch Intel main workflow.')
+  logging.info('Main workflow scheduled successfully.')
   logging.info('Merch Intel installation is complete!')
 
 

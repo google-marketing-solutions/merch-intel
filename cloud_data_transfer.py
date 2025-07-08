@@ -21,6 +21,7 @@ import logging
 import time
 from typing import Dict, Optional
 
+import auth
 import google.auth
 from google.auth import impersonated_credentials
 from google.auth.exceptions import DefaultCredentialsError
@@ -63,6 +64,7 @@ class CloudDataTransferUtils:
     >>> data_transfer = CloudDataTransferUtils('project_id')
     >>> data_transfer.create_merchant_center_transfer(12345, 'dataset_id', 'US')
   """
+  # TODO(b/432669656): Add unit tests for this class
 
   def __init__(
       self,
@@ -295,6 +297,14 @@ class CloudDataTransferUtils:
         merchant_id,
         destination_dataset,
     )
+    has_valid_credentials = self._check_valid_credentials(
+        _MERCHANT_CENTER_ID, dataset_location
+    )
+    version_info = None
+    if not has_valid_credentials:
+      version_info = self._get_version_info(
+          _MERCHANT_CENTER_ID, dataset_location
+      )
     parent = f'projects/{self.project_id}/locations/{dataset_location}'
     input_config = TransferConfig(
         display_name=f'Merchant Center Transfer - {merchant_id}',
@@ -306,6 +316,7 @@ class CloudDataTransferUtils:
     request = bigquery_datatransfer.CreateTransferConfigRequest(
         parent=parent,
         transfer_config=input_config,
+        version_info=version_info,
     )
     transfer_config = self.client.create_transfer_config(request)
     logging.info(
@@ -352,6 +363,14 @@ class CloudDataTransferUtils:
         customer_id,
         destination_dataset,
     )
+    has_valid_credentials = self._check_valid_credentials(
+        _GOOGLE_ADS_ID, dataset_location
+    )
+    version_info = None
+    if not has_valid_credentials:
+      version_info = self._get_version_info(
+          _GOOGLE_ADS_ID, dataset_location
+      )
     parent = f'projects/{self.project_id}/locations/{dataset_location}'
     input_config = TransferConfig(
         display_name=f'Google Ads Transfer - {customer_id}',
@@ -363,6 +382,7 @@ class CloudDataTransferUtils:
     request = bigquery_datatransfer.CreateTransferConfigRequest(
         parent=parent,
         transfer_config=input_config,
+        version_info=version_info,
     )
     transfer_config = self.client.create_transfer_config(request=request)
     logging.info(
@@ -416,7 +436,14 @@ class CloudDataTransferUtils:
       )
       self.client.start_manual_transfer_runs(request=request)
       return updated_transfer_config
-
+    has_valid_credentials = self._check_valid_credentials(
+        'scheduled_query', dataset_location
+    )
+    version_info = ''
+    if not has_valid_credentials:
+      version_info = self._get_version_info(
+          'scheduled_query', dataset_location
+      )
     parent = f'projects/{self.project_id}/locations/{dataset_location}'
     input_config = TransferConfig(
         display_name=name,
@@ -427,6 +454,7 @@ class CloudDataTransferUtils:
     request = bigquery_datatransfer.CreateTransferConfigRequest(
         parent=parent,
         transfer_config=input_config,
+        version_info=version_info,
     )
     transfer_config = self.client.create_transfer_config(request=request)
     logging.info('Scheduled query "%s" created successfully.', name)
@@ -441,3 +469,33 @@ class CloudDataTransferUtils:
         f'dataSources/{data_source_id}'
     )
     return self.client.get_data_source(name=name)
+
+  def _check_valid_credentials(
+      self, data_source_id: str, dataset_location: str
+  ) -> bool:
+    """Returns true if valid credentials exist for the given data source.
+
+    Args:
+      data_source_id: Data source ID.
+      dataset_location: Location of the BigQuery dataset.
+    """
+    name = f'projects/{self.project_id}/locations/{dataset_location}/dataSources/{data_source_id}'
+    response = self.client.check_valid_creds({'name': name})
+    return response.has_valid_creds
+
+  def _get_version_info(
+      self, data_source_id: str, dataset_location: str
+  ) -> str:
+    """Returns authorization code for a given data source.
+
+    Args:
+      data_source_id: Data source ID.
+      dataset_location: Location of the BigQuery dataset.
+    """
+    data_source = self._get_data_source(data_source_id, dataset_location)
+    client_id = data_source.client_id
+    scopes = data_source.scopes
+
+    if not data_source:
+      raise AssertionError('Invalid data source')
+    return auth.retrieve_version_info(client_id, scopes, data_source_id)

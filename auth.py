@@ -23,8 +23,8 @@ _BASE_URL = 'https://www.gstatic.com/bigquerydatatransfer/oauthz/auth'
 _REDIRECT_URI = 'urn:ietf:wg:oauth:2.0:oob'
 
 
-def retrieve_authorization_code(client_id: str, scopes: List[str],
-                                app_name: str) -> str:
+def retrieve_version_info(client_id: str, scopes: List[str],
+                          app_name: str) -> str:
   """Returns authorization code.
 
   Args:
@@ -33,14 +33,15 @@ def retrieve_authorization_code(client_id: str, scopes: List[str],
     app_name: Name of the app.
   """
   scopes_str = ' '.join(scopes)
-  authorization_code_request = {
+  version_info_request = {
       'client_id': client_id,
       'scope': scopes_str,
+      'response_type': 'version_info',
       'redirect_uri': _REDIRECT_URI
   }
 
   encoded_request = parse.urlencode(
-      authorization_code_request, quote_via=parse.quote)
+      version_info_request, quote_via=parse.quote)
   url = f'{_BASE_URL}?{encoded_request}'
   logging.info(
       'Please click on the URL below to authorize %s and paste the '

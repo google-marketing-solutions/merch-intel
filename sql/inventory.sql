@@ -19,6 +19,7 @@ CREATE OR REPLACE
     `{project_id}.{dataset}.inventory_proc`()
       BEGIN
 CREATE OR REPLACE TABLE `{project_id}.{dataset}.InventoryView`
+PARTITION BY date
 AS
 WITH
   PriceCompetitiveness AS (

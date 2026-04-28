@@ -255,6 +255,7 @@ LEFT JOIN AggregatedPerformance AS AP
     AND LOWER(AP.offer_id) = LOWER(P.offer_id)
     AND AP.target_country = PSC.targeted_country
     AND AP.language_code = P.content_language
+    AND AP.channel = P.channel
     AND DATE_ADD(AP.date, INTERVAL 1 DAY) = P._PARTITIONDATE
 WHERE
   P.channel = 'online'
